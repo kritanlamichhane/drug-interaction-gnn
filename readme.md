@@ -95,7 +95,7 @@ drug-interaction-gnn/
 
 ```bash
 # Clone
-git clone https://github.com/<your-username>/drug-interaction-gnn.git
+git clone https://github.com/lamichhanekritan/drug-interaction-gnn.git
 cd drug-interaction-gnn
 
 # Install dependencies
