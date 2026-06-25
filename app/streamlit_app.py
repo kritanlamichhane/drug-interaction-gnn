@@ -196,6 +196,17 @@ st.markdown("""
         display: block;
     }
 
+    /* SVG Molecular Highlights Container */
+    .svg-container {
+        background-color: #ffffff;
+        border: 3px solid rgba(255, 255, 255, 0.08);
+        border-radius: 12px;
+        padding: 10px;
+        display: inline-block;
+        margin: 10px auto;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.4);
+    }
+
     /* Tables */
     .premium-table {
         width: 100%;
@@ -266,7 +277,17 @@ def load_everything():
     drug2idx = build_drug_vocab(pairs)
     idx2drug = {v: k for k, v in drug2idx.items()}
 
-    return mlp, gcn, gat, x, edge_index, drug2idx, idx2drug, device
+    # Load SMILES cache
+    smiles_dict = {}
+    if os.path.exists('data/processed/smiles_cache.csv'):
+        try:
+            smiles_df = pd.read_csv('data/processed/smiles_cache.csv', index_col=0)
+            smiles_df.index = smiles_df.index.map(str)
+            smiles_dict = smiles_df['smiles'].dropna().to_dict()
+        except Exception as e:
+            print(f"Error loading smiles cache: {e}")
+
+    return mlp, gcn, gat, x, edge_index, drug2idx, idx2drug, smiles_dict, device
 
 # ── Helpers ───────────────────────────────────────────────────────────
 def predict(model, x, edge_index, idx1, idx2, device):
@@ -316,7 +337,6 @@ def get_shap_values(_mlp, _x, idx1, idx2, _device):
     explainer = shap.KernelExplainer(model_predict, background)
     shap_vals = explainer.shap_values(pair_feat, nsamples=50)
     
-    # Safely convert to a flat 1D array of 4096 values
     shap_vals = np.asarray(shap_vals).squeeze()
     if shap_vals.ndim > 1:
         shap_vals = shap_vals.reshape(-1)
@@ -342,7 +362,7 @@ def get_gnn_explanation(_gcn, _x, _edge_index, idx1, idx2, _device):
 
     explainer = Explainer(
         model=wrapped,
-        algorithm=GNNExplainer(epochs=50), # Fast epochs for web performance
+        algorithm=GNNExplainer(epochs=50),
         explanation_type='model',
         node_mask_type='attributes',
         edge_mask_type='object',
@@ -355,12 +375,222 @@ def get_gnn_explanation(_gcn, _x, _edge_index, idx1, idx2, _device):
 
     explanation = explainer(x=_x, edge_index=_edge_index)
     
-    # Process node importance sum
     node_importance = None
     if explanation.node_mask is not None:
         node_importance = explanation.node_mask.sum(dim=1).cpu().numpy()
         
     return node_importance
+
+# ── RDKit Molecule Drawing with Substructure Highlights ───────────────
+def draw_molecule_with_highlights(smiles, top_bits, highlight_mode="Combined Top Features", width=340, height=280):
+    if not smiles or pd.isna(smiles):
+        return None
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from rdkit.Chem.Draw import rdMolDraw2D
+        
+        mol = Chem.MolFromSmiles(str(smiles))
+        if mol is None:
+            return None
+            
+        info = {}
+        AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048, bitInfo=info)
+        
+        atoms_to_highlight = []
+        bonds_to_highlight = []
+        atom_colors = {}
+        bond_colors = {}
+        
+        for idx, (bit, val) in enumerate(top_bits):
+            if highlight_mode == "Risk-Increasing Only" and val <= 0:
+                continue
+            if highlight_mode == "Risk-Decreasing Only" and val >= 0:
+                continue
+            if "Bit " in highlight_mode and f"Bit {bit}" not in highlight_mode:
+                continue
+            if bit not in info:
+                continue
+                
+            color = (0.97, 0.44, 0.44) if val > 0 else (0.2, 0.83, 0.6)
+            
+            for atom_idx, radius in info[bit]:
+                if radius > 0:
+                    try:
+                        env = Chem.FindAtomEnvironmentOfRadiusN(mol, radius, atom_idx)
+                        for bond_idx in env:
+                            bond = mol.GetBondWithIdx(bond_idx)
+                            a1 = bond.GetBeginAtomIdx()
+                            a2 = bond.GetEndAtomIdx()
+                            atoms_to_highlight.extend([a1, a2])
+                            bonds_to_highlight.append(bond_idx)
+                            atom_colors[a1] = color
+                            atom_colors[a2] = color
+                            bond_colors[bond_idx] = color
+                    except Exception:
+                        atoms_to_highlight.append(atom_idx)
+                        atom_colors[atom_idx] = color
+                else:
+                    atoms_to_highlight.append(atom_idx)
+                    atom_colors[atom_idx] = color
+                    
+        atoms_to_highlight = list(set(atoms_to_highlight))
+        bonds_to_highlight = list(set(bonds_to_highlight))
+        
+        drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
+        opts = drawer.drawOptions()
+        opts.clearBackground = True
+        opts.backgroundColour = (1.0, 1.0, 1.0, 1.0)
+        
+        Chem.AllChem.Compute2DCoords(mol)
+        drawer.DrawMolecule(
+            mol, 
+            highlightAtoms=atoms_to_highlight, 
+            highlightAtomColors=atom_colors,
+            highlightBonds=bonds_to_highlight,
+            highlightBondColors=bond_colors
+        )
+        drawer.FinishDrawing()
+        
+        return drawer.GetDrawingText()
+    except Exception as e:
+        print(f"RDKit drawing failed: {e}")
+        return None
+
+# ── Pyvis Interactive Local Network ───────────────────────────────────
+def build_interactive_network(edge_index, idx1, idx2, drug1_name, drug2_name, idx2drug, node_importance=None):
+    from pyvis.network import Network
+    import tempfile
+    
+    mask1 = edge_index[0] == idx1
+    neigh1 = set(edge_index[1][mask1].cpu().numpy())
+    
+    mask2 = edge_index[0] == idx2
+    neigh2 = set(edge_index[1][mask2].cpu().numpy())
+    
+    shared = list(neigh1.intersection(neigh2))
+    unique1 = list(neigh1.difference(neigh2))
+    unique2 = list(neigh2.difference(neigh1))
+    
+    shared_to_show = shared[:10]
+    unique1_to_show = unique1[:8]
+    unique2_to_show = unique2[:8]
+    
+    nodes_to_include = {idx1, idx2}
+    nodes_to_include.update(shared_to_show)
+    nodes_to_include.update(unique1_to_show)
+    nodes_to_include.update(unique2_to_show)
+    
+    net = Network(height="450px", width="100%", bgcolor="#0f172a", font_color="#f1f5f9")
+    
+    # Configure beautiful, overlap-free network physics and layout via vis.js options
+    net.set_options("""
+    var options = {
+      "nodes": {
+        "font": {
+          "size": 11,
+          "face": "Inter, sans-serif",
+          "color": "#cbd5e1"
+        }
+      },
+      "edges": {
+        "smooth": {
+          "type": "continuous",
+          "forceDirection": "none"
+        }
+      },
+      "physics": {
+        "barnesHut": {
+          "gravitationalConstant": -5000,
+          "centralGravity": 0.1,
+          "springLength": 160,
+          "springStrength": 0.04,
+          "damping": 0.5,
+          "avoidOverlap": 1
+        },
+        "maxVelocity": 50,
+        "minVelocity": 0.75,
+        "solver": "barnesHut",
+        "stabilization": {
+          "enabled": true,
+          "iterations": 1000,
+          "updateInterval": 100,
+          "onlyDynamicEdges": false,
+          "fit": true
+        }
+      }
+    }
+    """)
+    
+    for n in nodes_to_include:
+        name = idx2drug[n]
+        size = 15
+        
+        if n == idx1:
+            color = "#3b82f6"
+            size = 32
+            group = "Target Drug 1"
+            title = f"Drug 1: {name} (Selected Target)"
+        elif n == idx2:
+            color = "#ec4899"
+            size = 32
+            group = "Target Drug 2"
+            title = f"Drug 2: {name} (Selected Target)"
+        elif n in shared_to_show:
+            color = "#a855f7"
+            size = 22
+            group = "Shared Neighbor"
+            title = f"Shared Neighbor: {name} (Interacts with both target drugs)"
+        elif n in unique1_to_show:
+            color = "#60a5fa"
+            size = 18
+            group = "Drug 1 Neighbor"
+            title = f"Neighbor of {drug1_name}: {name}"
+        else:
+            color = "#f472b6"
+            size = 18
+            group = "Drug 2 Neighbor"
+            title = f"Neighbor of {drug2_name}: {name}"
+            
+        if node_importance is not None and len(node_importance) > n:
+            importance = float(node_importance[n])
+            if n not in [idx1, idx2]:
+                size = max(10, int(15 + importance * 30))
+                title += f" | Graph Importance: {importance:.4f}"
+                
+        net.add_node(
+            int(n), 
+            label=name, 
+            title=title, 
+            color=color, 
+            size=size,
+            shape="dot"
+        )
+        
+    edge_pairs = edge_index.t().cpu().numpy()
+    added_edges = set()
+    
+    for u, v in edge_pairs:
+        if u in nodes_to_include and v in nodes_to_include:
+            edge_key = tuple(sorted((int(u), int(v))))
+            if edge_key not in added_edges:
+                added_edges.add(edge_key)
+                
+                if (u == idx1 and v == idx2) or (u == idx2 and v == idx1):
+                    net.add_edge(int(u), int(v), color="#f59e0b", width=5, title="Known BioSNAP Polypharmacy Interaction Link")
+                else:
+                    net.add_edge(int(u), int(v), color="rgba(255, 255, 255, 0.12)", width=1.5)
+                    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp:
+        net.save_graph(tmp.name)
+        tmp.seek(0)
+        html_content = tmp.read().decode('utf-8')
+    try:
+        os.unlink(tmp.name)
+    except Exception:
+        pass
+        
+    return html_content
 
 # ── Main Header Banner ────────────────────────────────────────────────
 st.markdown("""
@@ -375,8 +605,7 @@ st.markdown("""
 # Load data and models
 try:
     with st.spinner("Initializing models and loading graph weights..."):
-        mlp, gcn, gat, x, edge_index, drug2idx, idx2drug, device = load_everything()
-    # Create the sorted drug list for selectboxes
+        mlp, gcn, gat, x, edge_index, drug2idx, idx2drug, smiles_dict, device = load_everything()
     drug_list = sorted(list(drug2idx.keys()))
 except Exception as e:
     st.error(f"Error loading system assets: {e}")
@@ -385,7 +614,7 @@ except Exception as e:
 
 # ── Sidebar Configuration ─────────────────────────────────────────────
 st.sidebar.markdown("### ⚙️ Engine Control Panel")
-selected_device = st.sidebar.selectbox("Device Mode", ["Auto-Detect", "CPU Only", "GPU Only"])
+selected_device = st.sidebar.selectbox("Device Mode", [f"Auto-Detect ({device.type.upper()})"])
 decision_threshold = st.sidebar.slider("Decision Threshold (Risk Level)", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
 
 st.sidebar.markdown("---")
@@ -437,9 +666,11 @@ with tab_pred:
     idx1 = drug2idx[drug1]
     idx2 = drug2idx[drug2]
 
-    # Show chemical structure if available
     cid1 = get_pubchem_cid(drug1)
     cid2 = get_pubchem_cid(drug2)
+    
+    smiles1 = smiles_dict.get(drug1)
+    smiles2 = smiles_dict.get(drug2)
 
     col_mol1, col_mol2 = st.columns(2)
     with col_mol1:
@@ -475,21 +706,57 @@ with tab_pred:
         gcn_score = predict(gcn, x, edge_index, idx1, idx2, device)
         gat_score = predict(gat, x, edge_index, idx1, idx2, device) if gat is not None else 0.0
 
-        # Save scores to session state for explainability tab
         st.session_state['mlp_score'] = mlp_score
         st.session_state['gcn_score'] = gcn_score
         st.session_state['gat_score'] = gat_score
         st.session_state['analyzed_drugs'] = (drug1, drug2)
+        
+        if 'node_importance' in st.session_state:
+            del st.session_state['node_importance']
+        if 'shap_vals' in st.session_state:
+            del st.session_state['shap_vals']
 
         st.markdown("### 📊 Predicted Probability Scores")
 
-        # Metric grid
+        if gat is not None:
+            weights = np.array([0.9584, 0.9334, 0.9222])
+            scores = np.array([mlp_score, gcn_score, gat_score])
+        else:
+            weights = np.array([0.9584, 0.9334])
+            scores = np.array([mlp_score, gcn_score])
+            
+        consensus_score = np.sum(scores * weights) / np.sum(weights)
+        
+        if consensus_score > decision_threshold:
+            consensus_color = "#f87171"
+            consensus_glow = "rgba(239, 68, 68, 0.4)"
+            risk_label = "🚨 CRITICAL RISK: Co-administration is strongly counter-indicated by AI model consensus."
+        elif consensus_score > (decision_threshold - 0.15):
+            consensus_color = "#fbbf24"
+            consensus_glow = "rgba(245, 158, 11, 0.4)"
+            risk_label = "⚠️ MODERATE RISK: Potential interactions detected. Clinical oversight advised."
+        else:
+            consensus_color = "#34d399"
+            consensus_glow = "rgba(16, 185, 129, 0.4)"
+            risk_label = "✅ LOW RISK: The co-administration is marked as safe based on consensus analysis."
+
+        st.markdown(f"""
+        <div style="background: rgba(17, 24, 39, 0.65); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; padding: 25px; text-align: center; margin-bottom: 25px; box-shadow: 0 10px 30px -10px rgba(0,0,0,0.5);">
+            <div style="font-size: 0.9rem; text-transform: uppercase; font-weight: 700; letter-spacing: 0.08em; color: #9ca3af; margin-bottom: 8px;">Consensus Interaction Risk</div>
+            <div style="font-size: 3.2rem; font-weight: 800; color: {consensus_color}; font-family: 'Outfit', sans-serif; text-shadow: 0 0 20px {consensus_glow}; line-height: 1.1;">{consensus_score*100:.1f}%</div>
+            <div style="width: 100%; background-color: rgba(255,255,255,0.07); border-radius: 10px; height: 10px; margin: 18px 0; overflow: hidden; border: 1px solid rgba(255,255,255,0.03);">
+                <div style="background: linear-gradient(90deg, #34d399 0%, #fbbf24 60%, #f87171 100%); width: {consensus_score*100}%; height: 100%; border-radius: 10px; box-shadow: 0 0 10px {consensus_glow};"></div>
+            </div>
+            <div style="font-size: 1rem; color: #f3f4f6; font-weight: 600; font-family: 'Outfit', sans-serif;">{risk_label}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
         st.markdown(f"""
         <div class="metric-grid">
             <div class="metric-card">
-                <span class="metric-badge badge-mlp">MLP Baseline (Aromatic + Morgan)</span>
+                <span class="metric-badge badge-mlp">MLP Baseline (Chemical Features)</span>
                 <div class="metric-val">{mlp_score*100:.1f}%</div>
-                <div class="metric-desc">Best Model ROC-AUC: <b>0.958</b></div>
+                <div class="metric-desc">Feature Accuracy ROC-AUC: <b>0.958</b></div>
                 <div class="metric-desc {'risk-high' if mlp_score > decision_threshold else 'risk-low'}">
                     {'HIGH RISK' if mlp_score > decision_threshold else 'LOW RISK'}
                 </div>
@@ -497,7 +764,7 @@ with tab_pred:
             <div class="metric-card">
                 <span class="metric-badge badge-gcn">GCN Graph Model</span>
                 <div class="metric-val">{gcn_score*100:.1f}%</div>
-                <div class="metric-desc">Topology ROC-AUC: <b>0.933</b></div>
+                <div class="metric-desc">Topology Accuracy ROC-AUC: <b>0.933</b></div>
                 <div class="metric-desc {'risk-high' if gcn_score > decision_threshold else 'risk-low'}">
                     {'HIGH RISK' if gcn_score > decision_threshold else 'LOW RISK'}
                 </div>
@@ -505,7 +772,7 @@ with tab_pred:
             <div class="metric-card">
                 <span class="metric-badge badge-gat">GAT Graph Attention</span>
                 <div class="metric-val">{gat_score*100:.1f}%</div>
-                <div class="metric-desc">Attention ROC-AUC: <b>0.922</b></div>
+                <div class="metric-desc">Attention Accuracy ROC-AUC: <b>0.922</b></div>
                 <div class="metric-desc {'risk-high' if gat_score > decision_threshold else 'risk-low' if gat is not None else ''}">
                     {('HIGH RISK' if gat_score > decision_threshold else 'LOW RISK') if gat is not None else 'N/A'}
                 </div>
@@ -513,136 +780,168 @@ with tab_pred:
         </div>
         """, unsafe_allow_html=True)
 
-        # Safety Diagnosis banner
-        if mlp_score > decision_threshold:
-            st.markdown(f"""
-            <div class="custom-alert alert-danger">
-                <span class="alert-icon">⚠️</span>
-                <div class="alert-text">
-                    <strong>Critical Alert: High adverse interaction probability detected ({mlp_score*100:.1f}%).</strong><br>
-                    Combining <b>{drug1}</b> and <b>{drug2}</b> could yield high risks of adverse clinical side-effects. 
-                    Monitor patient metrics closely if combined administration is required.
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-            <div class="custom-alert alert-success">
-                <span class="alert-icon">✅</span>
-                <div class="alert-text">
-                    <strong>Safe Match: Low adverse interaction probability ({mlp_score*100:.1f}%).</strong><br>
-                    The prediction model marks the combination of <b>{drug1}</b> and <b>{drug2}</b> as relatively safe. 
-                    Ensure checking other therapeutic counter-indications.
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown("""
-        <p style="text-align: center; color: #6b7280; margin-top: 10px; font-size: 0.85rem;">
-            Note: Predictions are powered by features compiled from 2048-bit Morgan chemical fingerprint descriptors.
-        </p>
-        """, unsafe_allow_html=True)
+        with st.expander("📚 Clinical Disclaimer & How to Interpret"):
+            st.markdown("""
+            - **Disclaimer**: This tool is a proof-of-concept AI prediction platform based on high-confidence drug interaction mappings from Stanford's BioSNAP dataset. It should not be used as a clinical consultation system.
+            - **Score Meanings**: The score predicts the likelihood that the two compounds cause a significant polypharmacy adverse event.
+            - **Models Contrast**: 
+              - The **MLP** represents structural chemical alignment.
+              - The **GNN models (GCN/GAT)** represent how topological pathways in the biomedical graph route interactions.
+            """)
 
 # ==========================================
-# TAB 2: Interpretation & Explanations (Dual)
+# TAB 2: Interpretation & Explanations
 # ==========================================
 with tab_explain:
     st.markdown("""
     <div class="glass-card">
         <div class="glass-card-title">🔍 Dual Explainability Dashboard</div>
-        <p style="color: #9ca3af; font-size: 0.9rem;">
-            We offer two distinct paradigms of explainability:
-            <ol>
-                <li><b>GNNExplainer on GCN Graph Model</b>: Identifies influential neighboring context drugs in the interaction graph topology.</li>
-                <li><b>SHAP on MLP Model</b>: Identifies structural molecular bits (Morgan Fingerprints) driving the prediction.</li>
-            </ol>
+        <p style="color: #9ca3af; font-size: 0.9rem; margin-bottom: 0;">
+            This panel explains predictions at two distinct scales: **graph topological influence** (network context) and **molecular fingerprint decomposition** (substructure importance).
         </p>
     </div>
     """, unsafe_allow_html=True)
 
-    # Check if a pair has been analyzed
     has_analyzed = 'analyzed_drugs' in st.session_state
     if has_analyzed:
         active_drug1, active_drug2 = st.session_state['analyzed_drugs']
-        st.info(f"Currently explaining: **{active_drug1}** and **{active_drug2}**")
+        st.info(f"Showing explanations for: **{active_drug1}** and **{active_drug2}**")
     else:
         active_drug1, active_drug2 = drug1, drug2
-        st.warning("Please click 'Analyze Interaction Risk' in the first tab to pre-load specific scores, or use the current selection below.")
+        st.warning("⚠️ Run 'Analyze Interaction Risk' in the first tab to analyze risk, or proceed with current defaults below.")
 
     active_idx1 = drug2idx[active_drug1]
     active_idx2 = drug2idx[active_drug2]
+    
+    active_smiles1 = smiles_dict.get(active_drug1)
+    active_smiles2 = smiles_dict.get(active_drug2)
 
-    # Create Columns for the two explainers
     col_exp_gnn, col_exp_shap = st.columns(2)
 
     with col_exp_gnn:
         st.markdown("### 🕸️ 1. Graph Explanations (GNNExplainer)")
-        st.markdown("Identifies the neighboring drug nodes that have the highest topological impact on the GCN's prediction.")
+        st.markdown("This identifies the neighboring drug nodes that have the highest topological impact on the GCN model's prediction.")
         
-        run_gnn = st.checkbox("🚀 Run GNNExplainer Analysis (Takes ~10 seconds)")
+        run_gnn = st.checkbox("🚀 Run GNNExplainer analysis", key="run_gnn_check")
         if run_gnn:
-            with st.spinner("Computing sub-graph node importance using GNNExplainer..."):
-                try:
-                    node_importance = get_gnn_explanation(gcn, x, edge_index, active_idx1, active_idx2, device)
-                    
-                    if node_importance is not None:
-                        # Find indices of top nodes excluding the target nodes themselves
-                        top_nodes = np.argsort(node_importance)[::-1]
-                        top_nodes_filtered = [node_idx for node_idx in top_nodes if node_idx not in [active_idx1, active_idx2]][:5]
-                        
-                        top_node_names = [idx2drug[n] for n in top_nodes_filtered]
-                        top_node_scores = node_importance[top_nodes_filtered]
-                        
-                        df_gnn = pd.DataFrame({
-                            'Influential Drug Node': top_node_names,
-                            'Importance Score': top_node_scores
-                        })
-                        
-                        st.success("GNNExplainer completed successfully!")
-                        st.dataframe(df_gnn, use_container_width=True, hide_index=True)
-                        st.bar_chart(data=df_gnn, x='Influential Drug Node', y='Importance Score')
-                    else:
-                        st.error("No node importance attributes returned by GNNExplainer.")
-                except Exception as e:
-                    st.error(f"Failed to generate GNNExplainer visualization: {e}")
+            if 'node_importance' not in st.session_state:
+                with st.spinner("Computing sub-graph node importance weights via GNNExplainer..."):
+                    try:
+                        node_importance = get_gnn_explanation(gcn, x, edge_index, active_idx1, active_idx2, device)
+                        st.session_state['node_importance'] = node_importance
+                    except Exception as e:
+                        st.error(f"GNNExplainer failed: {e}")
+                        node_importance = None
+            else:
+                node_importance = st.session_state['node_importance']
+
+            if node_importance is not None:
+                top_nodes = np.argsort(node_importance)[::-1]
+                top_nodes_filtered = [node_idx for node_idx in top_nodes if node_idx not in [active_idx1, active_idx2]][:5]
+                
+                top_node_names = [idx2drug[n] for n in top_nodes_filtered]
+                top_node_scores = node_importance[top_nodes_filtered]
+                
+                df_gnn = pd.DataFrame({
+                    'Influential Drug Node': top_node_names,
+                    'GNN Explainer Importance': top_node_scores
+                })
+                
+                st.success("GNNExplainer analysis completed.")
+                st.bar_chart(data=df_gnn, x='Influential Drug Node', y='GNN Explainer Importance', color='#a78bfa')
+                st.dataframe(df_gnn, use_container_width=True, hide_index=True)
+            else:
+                st.error("No node importance scores returned.")
 
     with col_exp_shap:
         st.markdown("### 🔬 2. Molecular Explanations (SHAP)")
-        st.markdown("Identifies which structural molecular bits of the Morgan Fingerprints drive the MLP predictions.")
+        st.markdown("This identifies which structural molecular bits of the 2048-bit Morgan Fingerprints drive the prediction.")
         
-        run_shap = st.checkbox("🚀 Run SHAP Attribution Analysis (Takes ~15 seconds)")
+        run_shap = st.checkbox("🚀 Run SHAP Attribution analysis", key="run_shap_check")
         if run_shap:
-            with st.spinner("Attributing molecular features with SHAP KernelExplainer..."):
-                try:
-                    shap_vals = get_shap_values(mlp, x, active_idx1, active_idx2, device)
-                    
-                    shap_d1 = shap_vals[:2048]
-                    shap_d2 = shap_vals[2048:]
-                    
-                    # Fetch top 5 bits for each drug
-                    top_bits1 = np.argsort(np.abs(shap_d1))[::-1][:5]
-                    top_bits2 = np.argsort(np.abs(shap_d2))[::-1][:5]
-                    
-                    st.success("SHAP analysis completed successfully!")
-                    
-                    st.markdown(f"**Top Attributes for {active_drug1}:**")
+            if 'shap_vals' not in st.session_state:
+                with st.spinner("Computing molecular feature SHAP values (takes ~15s)..."):
+                    try:
+                        shap_vals = get_shap_values(mlp, x, active_idx1, active_idx2, device)
+                        st.session_state['shap_vals'] = shap_vals
+                    except Exception as e:
+                        st.error(f"SHAP failed: {e}")
+                        shap_vals = None
+            else:
+                shap_vals = st.session_state['shap_vals']
+
+            if shap_vals is not None:
+                shap_d1 = shap_vals[:2048]
+                shap_d2 = shap_vals[2048:]
+                
+                top_bits_idx1 = np.argsort(np.abs(shap_d1))[::-1][:5]
+                top_bits1 = [(bit, shap_d1[bit]) for bit in top_bits_idx1]
+                
+                top_bits_idx2 = np.argsort(np.abs(shap_d2))[::-1][:5]
+                top_bits2 = [(bit, shap_d2[bit]) for bit in top_bits_idx2]
+                
+                st.success("SHAP analysis completed.")
+                
+                col_tab1, col_tab2 = st.columns(2)
+                with col_tab1:
+                    st.markdown(f"**Top Bits for {active_drug1}**")
                     df_shap1 = pd.DataFrame({
-                        'Fingerprint Bit ID': [f"Bit {bit}" for bit in top_bits1],
-                        'SHAP Importance': shap_d1[top_bits1],
-                        'Direction': ['↑ Increases Risk' if v > 0 else '↓ Decreases Risk' for v in shap_d1[top_bits1]]
+                        'Bit ID': [f"Bit {b}" for b, _ in top_bits1],
+                        'SHAP': [v for _, v in top_bits1],
+                        'Risk': ['↑ Increase' if v > 0 else '↓ Decrease' for _, v in top_bits1]
                     })
                     st.dataframe(df_shap1, use_container_width=True, hide_index=True)
-                    
-                    st.markdown(f"**Top Attributes for {active_drug2}:**")
+                with col_tab2:
+                    st.markdown(f"**Top Bits for {active_drug2}**")
                     df_shap2 = pd.DataFrame({
-                        'Fingerprint Bit ID': [f"Bit {bit}" for bit in top_bits2],
-                        'SHAP Importance': shap_d2[top_bits2],
-                        'Direction': ['↑ Increases Risk' if v > 0 else '↓ Decreases Risk' for v in shap_d2[top_bits2]]
+                        'Bit ID': [f"Bit {b}" for b, _ in top_bits2],
+                        'SHAP': [v for _, v in top_bits2],
+                        'Risk': ['↑ Increase' if v > 0 else '↓ Decrease' for _, v in top_bits2]
                     })
                     st.dataframe(df_shap2, use_container_width=True, hide_index=True)
 
-                except Exception as e:
-                    st.error(f"Failed to generate SHAP attributes: {e}")
+    if run_shap and 'shap_vals' in st.session_state and st.session_state['shap_vals'] is not None:
+        st.markdown("---")
+        st.markdown("### 🎨 Interactive Molecular Structure Highlights (SHAP Mapped)")
+        st.markdown("""
+        Select how to visualize the molecular features on the chemical structure drawings. 
+        <span style="color:#f87171;font-weight:bold;">Red highlights</span> represent structures increasing interaction risk; 
+        <span style="color:#34d399;font-weight:bold;">Green highlights</span> represent structures decreasing risk.
+        """, unsafe_allow_html=True)
+        
+        mode_opts = ["Combined Top Features", "Risk-Increasing Only", "Risk-Decreasing Only"]
+        
+        col_ctrl1, col_ctrl2 = st.columns(2)
+        with col_ctrl1:
+            bit_opts_1 = mode_opts + [f"Bit {b} ({'Increases' if v > 0 else 'Decreases'} Risk)" for b, v in top_bits1]
+            highlight_mode_1 = st.selectbox(f"Highlight Mode for {active_drug1}", bit_opts_1, key="hm_1")
+        with col_ctrl2:
+            bit_opts_2 = mode_opts + [f"Bit {b} ({'Increases' if v > 0 else 'Decreases'} Risk)" for b, v in top_bits2]
+            highlight_mode_2 = st.selectbox(f"Highlight Mode for {active_drug2}", bit_opts_2, key="hm_2")
+            
+        col_draw1, col_draw2 = st.columns(2)
+        
+        with col_draw1:
+            st.markdown(f"<div style='text-align:center;'><strong>{active_drug1} Substructures</strong></div>", unsafe_allow_html=True)
+            if active_smiles1:
+                svg1 = draw_molecule_with_highlights(active_smiles1, top_bits1, highlight_mode_1)
+                if svg1:
+                    st.markdown(f'<div class="svg-container">{svg1}</div>', unsafe_allow_html=True)
+                else:
+                    st.caption("RDKit rendering unavailable for this compound.")
+            else:
+                st.caption("SMILES representation missing for this compound.")
+                
+        with col_draw2:
+            st.markdown(f"<div style='text-align:center;'><strong>{active_drug2} Substructures</strong></div>", unsafe_allow_html=True)
+            if active_smiles2:
+                svg2 = draw_molecule_with_highlights(active_smiles2, top_bits2, highlight_mode_2)
+                if svg2:
+                    st.markdown(f'<div class="svg-container">{svg2}</div>', unsafe_allow_html=True)
+                else:
+                    st.caption("RDKit rendering unavailable for this compound.")
+            else:
+                st.caption("SMILES representation missing for this compound.")
 
 # ==========================================
 # TAB 3: Local Graph Explorer
@@ -652,46 +951,64 @@ with tab_explore:
     <div class="glass-card">
         <div class="glass-card-title">🕸️ BioSNAP Network Neighbors</div>
         <p style="color: #9ca3af; font-size: 0.9rem;">
-            GNN models make predictions by querying neighboring entities in the drug interaction graph. 
-            Below are the confirmed interaction neighbors loaded from the TWOSIDES database.
+            This panel renders the localized biomedical knowledge graph neighborhood around the selected drug pair. 
+            Drag nodes, zoom, or hover on links to explore connection pathways.
         </p>
     </div>
     """, unsafe_allow_html=True)
 
-    col_net1, col_net2 = st.columns(2)
-    
-    # We display details for the currently active drugs
     active_drug1 = st.session_state.get('analyzed_drugs', (drug1, drug2))[0]
     active_drug2 = st.session_state.get('analyzed_drugs', (drug1, drug2))[1]
     
     idx1 = drug2idx[active_drug1]
     idx2 = drug2idx[active_drug2]
 
+    node_importance = st.session_state.get('node_importance', None)
+    
+    with st.spinner("Generating interactive subgraph visualization..."):
+        network_html = build_interactive_network(
+            edge_index, 
+            idx1, 
+            idx2, 
+            active_drug1, 
+            active_drug2, 
+            idx2drug,
+            node_importance
+        )
+        
+    st.components.v1.html(network_html, height=480, scrolling=False)
+    
+    st.markdown("""
+    <div style="display:flex; justify-content:center; gap:20px; font-size:0.85rem; margin-top:5px; margin-bottom:20px;">
+        <div><span style="color:#3b82f6; font-size:1.2rem;">●</span> Target Drug 1</div>
+        <div><span style="color:#ec4899; font-size:1.2rem;">●</span> Target Drug 2</div>
+        <div><span style="color:#a855f7; font-size:1.2rem;">●</span> Shared Neighbor Node</div>
+        <div><span style="color:#60a5fa; font-size:1.2rem;">●</span> Drug 1 Neighbor</div>
+        <div><span style="color:#f472b6; font-size:1.2rem;">●</span> Drug 2 Neighbor</div>
+        <div><span style="color:#f59e0b; font-size:1.2rem;">▬</span> Known DDI Link</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_net1, col_net2 = st.columns(2)
     with col_net1:
         st.markdown(f"#### **{active_drug1} Neighbors**")
         neighbors1 = get_neighbors(edge_index, idx1)
-        st.write(f"Connected to **{len(neighbors1)}** visible neighbor nodes in BioSNAP graph:")
-        
         neighbor_names1 = [idx2drug[n] for n in neighbors1]
         cids1 = [get_pubchem_cid(name) for name in neighbor_names1]
-        
         neigh_df1 = pd.DataFrame({
             'Neighbor ID': neighbor_names1,
-            'PubChem Link': [f"https://pubchem.ncbi.nlm.nih.gov/compound/{c}" if c else 'N/A' for c in cids1]
+            'PubChem CID': [str(c) if c else 'N/A' for c in cids1]
         })
         st.dataframe(neigh_df1, use_container_width=True, hide_index=True)
         
     with col_net2:
         st.markdown(f"#### **{active_drug2} Neighbors**")
         neighbors2 = get_neighbors(edge_index, idx2)
-        st.write(f"Connected to **{len(neighbors2)}** visible neighbor nodes in BioSNAP graph:")
-        
         neighbor_names2 = [idx2drug[n] for n in neighbors2]
         cids2 = [get_pubchem_cid(name) for name in neighbor_names2]
-        
         neigh_df2 = pd.DataFrame({
             'Neighbor ID': neighbor_names2,
-            'PubChem Link': [f"https://pubchem.ncbi.nlm.nih.gov/compound/{c}" if c else 'N/A' for c in cids2]
+            'PubChem CID': [str(c) if c else 'N/A' for c in cids2]
         })
         st.dataframe(neigh_df2, use_container_width=True, hide_index=True)
 
@@ -708,7 +1025,6 @@ with tab_benchmarks:
     </div>
     """, unsafe_allow_html=True)
 
-    # Benchmark table
     st.markdown("""
     <table class="premium-table">
         <thead>
