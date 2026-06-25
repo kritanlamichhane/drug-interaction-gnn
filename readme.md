@@ -1,6 +1,6 @@
 # drug-interaction-gnn
 
-> Predicting unknown drug-drug interactions using Graph Attention Networks on biomedical knowledge graphs — with molecular-level explainability via GNNExplainer.
+> Predicting unknown drug-drug interactions using Graph Neural Networks on biomedical knowledge graphs — with molecular-level explainability via GNNExplainer and SHAP.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.5.1-orange?style=flat-square)
@@ -18,19 +18,21 @@ Drug-drug interactions (DDIs) are a leading cause of adverse drug events — yet
 - **Edges** = known polypharmacy interactions (from BioSNAP-TWOSIDES)
 - **Task** = predict whether an unknown drug pair will interact
 
-A Graph Attention Network (GAT) is trained to learn relational drug representations, and GNNExplainer surfaces which molecular substructures drive each prediction.
+Three models are trained and compared — MLP baseline, GCN, and GAT. Explainability is provided via GNNExplainer (graph-level) and SHAP (molecular feature-level). An interactive Streamlit demo allows real-time prediction and explanation for any drug pair.
 
 ---
 
 ## Results
 
-| Model | ROC-AUC | Average Precision |
-|---|---|---|
-| MLP (baseline) | TBD | TBD |
-| GCN | TBD | TBD |
-| **GAT (ours)** | **TBD** | **TBD** |
+| Model | ROC-AUC | Avg Precision | Uses Graph |
+|---|---|---|---|
+| **MLP (best)** | **0.9584** | **0.9602** | No |
+| GCN | 0.9334 | 0.9398 | Yes |
+| GAT | 0.9222 | 0.9266 | Yes |
 
-> Results on held-out edge test split. Negative samples drawn via random sampling. Will be updated after training.
+> Results on held-out edge test split (10%). Negative samples drawn via random sampling.
+
+**Key finding:** MLP outperforms GNNs because Morgan fingerprints are highly expressive on this dense interaction graph. Graph aggregation causes over-smoothing — blurring the molecular signal rather than sharpening it. This is consistent with known over-smoothing literature and is itself an interesting result.
 
 ---
 
@@ -45,14 +47,17 @@ Morgan Fingerprints (RDKit, radius=2, 2048-bit)
     ▼
 PyG Graph  ──  nodes: 645 drugs, edges: 63,473 known DDIs
     │
-    ▼
-Graph Attention Network (2-layer GAT, 4 attention heads)
+    ├── MLP Baseline  ──  concatenate pair fingerprints → 3-layer MLP
+    ├── GCN           ──  2-layer graph convolution + dot product decoder  
+    └── GAT           ──  2-layer graph attention (4 heads) + dot product decoder
     │
     ▼
-Link Prediction Head  ──  score(u,v) = sigmoid(h_u · h_v)
+Explainability
+    ├── GNNExplainer  ──  influential neighbors + graph edges (GCN)
+    └── SHAP          ──  fingerprint bit importance (MLP)
     │
     ▼
-GNNExplainer  ──  per-prediction feature importance
+Streamlit Demo  ──  real-time prediction + explanation for any drug pair
 ```
 
 ---
@@ -61,12 +66,12 @@ GNNExplainer  ──  per-prediction feature importance
 
 | Source | Description | Size |
 |---|---|---|
-| [BioSNAP-TWOSIDES](https://snap.stanford.edu/biodata/datasets/10017/10017-ChChSe-Decagon.html) | Polypharmacy side effects for drug pairs, filtered to interactions with strong statistical evidence (PRR score, min 500 drug pairs) | 645 drugs, 63,473 pairs, 1,317 side effects |
+| [BioSNAP-TWOSIDES](https://snap.stanford.edu/biodata/datasets/10017/10017-ChChSe-Decagon.html) | Polypharmacy side effects for drug pairs, filtered to high-confidence interactions | 645 drugs, 63,473 pairs, 1,317 side effects |
 | [PubChem REST API](https://pubchem.ncbi.nlm.nih.gov/docs/pug-rest) | SMILES strings for molecular fingerprint computation | Free, no registration |
 
-**Why BioSNAP over raw TWOSIDES?** The raw TWOSIDES dataset contains 4.6M rows with weak signals. BioSNAP is a cleaned version filtered by Stanford researchers, keeping only interactions with strong statistical evidence. This is the version used in most published DDI prediction benchmarks, making our results directly comparable to state-of-the-art papers.
+**Why BioSNAP over raw TWOSIDES?** Raw TWOSIDES has 4.6M rows with weak signals. BioSNAP is filtered by Stanford researchers to high-confidence interactions, used in most published DDI benchmarks — making results directly comparable to state-of-the-art papers.
 
-**No manual downloads required** — running `src/dataset.py` automatically fetches SMILES strings from PubChem and caches them locally.
+**No manual downloads required** — `src/dataset.py` automatically fetches SMILES from PubChem and caches them locally.
 
 ---
 
@@ -76,19 +81,19 @@ GNNExplainer  ──  per-prediction feature importance
 drug-interaction-gnn/
 ├── data/
 │   ├── raw/               # BioSNAP-TWOSIDES download
-│   └── processed/         # PyG Data objects + SMILES cache
+│   └── processed/         # PyG Data object + SMILES cache (git-ignored)
 ├── src/
-│   ├── dataset.py         # Graph construction + feature engineering
-│   ├── model.py           # MLP baseline, GCN, GAT model definitions
-│   ├── train.py           # Training loop + evaluation
-│   └── explain.py         # GNNExplainer wrapper
+│   ├── dataset.py         # Graph construction + Morgan fingerprint features
+│   ├── model.py           # MLP baseline, GCN, GAT definitions
+│   ├── train.py           # Training loop + ROC-AUC evaluation
+│   └── explain.py         # GNNExplainer (GCN) + SHAP (MLP)
 ├── notebooks/
 │   ├── 01_eda.ipynb       # Exploratory data analysis
 │   ├── 02_training.ipynb  # Model training walkthrough
 │   └── 03_explain.ipynb   # Explainability demos
 ├── app/
 │   └── streamlit_app.py   # Interactive demo
-├── models/                # Saved model checkpoints
+├── models/                # Saved checkpoints (git-ignored)
 ├── requirements.txt
 └── README.md
 ```
@@ -106,25 +111,49 @@ cd drug-interaction-gnn
 conda create -n ddi python=3.10 -y
 conda activate ddi
 
-# Install dependencies
+# Install PyTorch (CUDA 12.1)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
+
+# Install PyG
+pip install torch-scatter torch-sparse torch-cluster torch-spline-conv \
+  -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
 pip install torch-geometric
+
+# Install RDKit (must use conda)
 conda install -c conda-forge rdkit -y
+
+# Install remaining dependencies
 pip install -r requirements.txt
 
-# Download BioSNAP-TWOSIDES dataset
+# Download BioSNAP-TWOSIDES
 # Place ChChSe-Decagon_polypharmacy.csv in data/raw/TWOSIDES.csv
 
-# Build graph + compute node features (fetches SMILES from PubChem automatically)
+# Build graph + compute node features (fetches SMILES from PubChem)
 python src/dataset.py
 
-# Train
-python src/train.py --model gat --epochs 100
+# Train all three models
+python -m src.train --model mlp --epochs 50
+python -m src.train --model gcn --epochs 100
+python -m src.train --model gat --epochs 100
 
-# Run Streamlit demo
+# Run explainability
+python -m src.explain
+
+# Launch Streamlit demo
 streamlit run app/streamlit_app.py
 ```
+
+---
+
+## Explainability
+
+Two complementary approaches are used:
+
+**GNNExplainer (on GCN)** — identifies which neighboring drugs and graph edges are most influential for a specific prediction. Answers: *"which part of the drug network drove this?"*
+
+**SHAP (on MLP)** — identifies which of the 2048 Morgan fingerprint bits most influenced the prediction. Answers: *"which molecular substructures of these two drugs drove this?"*
+
+Together they provide both network-level and molecular-level explanations for every prediction.
 
 ---
 
@@ -135,29 +164,15 @@ Tested on:
 - PyTorch 2.5.1 + CUDA 12.1
 - PyTorch Geometric 2.8.0
 - RDKit (conda-forge)
-- Windows 11, NVIDIA RTX 3050 6GB
+- Windows 11, NVIDIA GeForce RTX 3050 6GB Laptop GPU
 
-RDKit **must** be installed via conda, not pip — it has C++ bindings that conda handles cleanly.
-
----
-
-## How It Works
-
-**1. Data pipeline** — BioSNAP-TWOSIDES provides 63,473 unique drug pairs with confirmed polypharmacy side effects. Each unique pair becomes one edge in the graph regardless of how many side effects it causes (binary interaction task).
-
-**2. Feature engineering** — SMILES strings are fetched from PubChem's REST API for each of the 645 drugs and cached locally. RDKit computes 2048-bit Morgan fingerprints (radius=2) capturing local molecular substructure around each atom.
-
-**3. Graph construction** — drugs are nodes; confirmed interactions are positive edges. Negative edges are randomly sampled from unobserved pairs. The graph is split at the edge level (not node level) into 80/10/10 train/val/test sets.
-
-**4. Model progression** — three models are trained in order: MLP baseline (no graph), GCN (uniform neighbor aggregation), GAT (attention-weighted aggregation). The progression shows how graph structure and attention each contribute to performance.
-
-**5. Explainability** — GNNExplainer identifies the most influential node features and neighboring drugs for each predicted interaction, mapped back to molecular substructures via RDKit.
+RDKit **must** be installed via conda, not pip.
 
 ---
 
 ## Limitations
 
-- Negative sampling assumes unobserved pairs are non-interacting, which may introduce noise since many pairs are simply unstudied
+- Negative sampling assumes unobserved pairs are non-interacting — may introduce noise since many pairs are simply unstudied
 - Morgan fingerprints don't capture 3D molecular geometry
 - Model is transductive — retraining required for entirely new drugs not in the graph
 - Binary task only — does not predict which specific side effect will occur
@@ -169,9 +184,11 @@ RDKit **must** be installed via conda, not pip — it has C++ bindings that cond
 - Multi-label classification to predict specific side effect types (1,317 classes)
 - Add protein target embeddings as additional node features
 - Heterogeneous graphs with drugs, proteins, and diseases as different node types
-- Inductive setting — generalize to entirely unseen drugs using molecular features alone
+- Inductive setting — generalize to unseen drugs using molecular features alone
+- Fix over-smoothing via residual connections or PairNorm
 
 ---
+
 
 ## License
 
