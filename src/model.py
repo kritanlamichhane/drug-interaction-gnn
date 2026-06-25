@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATConv
 
-# ── 1. MLP Baseline ───────────────────────────────────────────────────
+# MLP Baseline 
 class MLPBaseline(nn.Module):
     def __init__(self, input_dim=2048):
         super(MLPBaseline, self).__init__()
@@ -22,7 +22,7 @@ class MLPBaseline(nn.Module):
         h = self.dropout(h)
         return self.fc3(h).squeeze()
 
-# ── 2. GCN Model ──────────────────────────────────────────────────────
+# GCN Model
 class GCNModel(nn.Module):
     def __init__(self, input_dim=2048, hidden_dim=256, output_dim=64):
         super(GCNModel, self).__init__()
@@ -48,7 +48,7 @@ class GCNModel(nn.Module):
         z = self.encode(x, edge_index)
         return self.decode(z, target_edges)
 
-# ── 3. GAT Model (final model) ────────────────────────────────────────
+# GAT Model (final model) 
 class GATModel(nn.Module):
     def __init__(self, input_dim=2048, hidden_dim=256, output_dim=64, heads=4):
         super(GATModel, self).__init__()
