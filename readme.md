@@ -1,204 +1,165 @@
-# drug-interaction-gnn
+# BioSNAP Drug Interaction Engine (GNN + Explainability)
 
-> Predicting unknown drug-drug interactions using Graph Neural Networks on biomedical knowledge graphs — with molecular-level explainability via GNNExplainer and SHAP.
+> Predicting unknown drug-drug interactions (DDIs) using Graph Neural Networks and molecular fingerprints on biomedical knowledge graphs — with dual molecular & network explainability via GNNExplainer and SHAP.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.5.1-orange?style=flat-square)
 ![PyG](https://img.shields.io/badge/PyTorch_Geometric-2.8.0-purple?style=flat-square)
+![RDKit](https://img.shields.io/badge/RDKit-2024.03+-green?style=flat-square)
 ![CUDA](https://img.shields.io/badge/CUDA-12.1-green?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
 
 ---
 
-## Overview
+##  Key Highlights
 
-Drug-drug interactions (DDIs) are a leading cause of adverse drug events — yet the interaction space between thousands of approved drugs is largely uncharted. This project frames DDI prediction as a **link prediction problem on a biomedical knowledge graph**, where:
-
-- **Nodes** = drugs (featurized with Morgan molecular fingerprints via RDKit)
-- **Edges** = known polypharmacy interactions (from BioSNAP-TWOSIDES)
-- **Task** = predict whether an unknown drug pair will interact
-
-Three models are trained and compared — MLP baseline, GCN, and GAT. Explainability is provided via GNNExplainer (graph-level) and SHAP (molecular feature-level). An interactive Streamlit demo allows real-time prediction and explanation for any drug pair.
-
----
-
-## Results
-
-| Model | ROC-AUC | Avg Precision | Uses Graph |
-|---|---|---|---|
-| **MLP (best)** | **0.9584** | **0.9602** | No |
-| GCN | 0.9334 | 0.9398 | Yes |
-| GAT | 0.9222 | 0.9266 | Yes |
-
-> Results on held-out edge test split (10%). Negative samples drawn via random sampling.
-
-**Key finding:** MLP outperforms GNNs because Morgan fingerprints are highly expressive on this dense interaction graph. Graph aggregation causes over-smoothing — blurring the molecular signal rather than sharpening it. This is consistent with known over-smoothing literature and is itself an interesting result.
+-  **Interactive Streamlit Web Dashboard**: Search drugs by **Generic Drug Names** (e.g. *Ampicillin*, *Lisinopril*, *Fentanyl*, *Aspirin*, *Warfarin*) with local 2D RDKit chemical rendering.
+-  **Multi-Model Consensus**: Compares predictions from an MLP baseline (**0.958 ROC-AUC**), Graph Convolutional Network (GCN, **0.933 ROC-AUC**), and Graph Attention Network (GAT, **0.922 ROC-AUC**).
+-  **Dual Explainability Suite**:
+  - **Network Topology (GNNExplainer)**: Pinpoints the most influential neighboring context drugs in the knowledge graph.
+  - **Molecular Fingerprint Attributions (SHAP)**: Pinpoints the 2048-bit Morgan circular fingerprint sub-structures driving interaction risk.
+-  **Knowledge Graph Neighborhood Explorer**: Inspects shared mutual interactors and local connectivity across the 63,473 BioSNAP interaction network.
 
 ---
 
-## Architecture
+##  Benchmark Results
+
+Evaluated on held-out test splits (10% test edges) with uniform negative sampling:
+
+| Model Architecture | Test ROC-AUC | Test Avg Precision (AP) | Graph Modality | Primary Mechanism |
+|---|---|---|---|---|
+| **MLP Baseline (Best)** | **0.9584** | **0.9602** | No (Direct Molecular) | 2048-bit Morgan Fingerprint concatenation |
+| **GCN Model** | **0.9334** | **0.9398** | Yes (Topology + Features) | 2-layer spectral graph convolution |
+| **GAT Model** | **0.9222** | **0.9266** | Yes (Attention + Features) | 2-layer graph attention with 4 heads |
+
+### a Finding: Why does MLP outperform GNNs?
+On this biomedical dataset, the **MLP baseline outperforms GNNs** due to **Graph Over-Smoothing**:
+- The BioSNAP-TWOSIDES graph is dense (**63,473 edges among 645 drugs**, ~30.5% graph density).
+- Repeated message aggregation across densely connected vertices causes node embeddings to become overly similar, diluting distinct chemical signatures.
+- Direct evaluation of Morgan fingerprints avoids this smoothing effect and preserves fine-grained chemical pharmacophores.
+
+---
+
+##  Architecture
 
 ```
-Drug SMILES  (fetched from PubChem REST API)
+Drug SMILES  (PubChem PUG REST API / Local Cache)
     │
     ▼
-Morgan Fingerprints (RDKit, radius=2, 2048-bit)
+Morgan Fingerprints (RDKit, radius=2, 2048-bit bit vectors)
     │
     ▼
-PyG Graph  ──  nodes: 645 drugs, edges: 63,473 known DDIs
+PyG Knowledge Graph  ──  nodes: 645 drugs, edges: 63,473 known DDIs
     │
-    ├── MLP Baseline  ──  concatenate pair fingerprints → 3-layer MLP
-    ├── GCN           ──  2-layer graph convolution + dot product decoder  
-    └── GAT           ──  2-layer graph attention (4 heads) + dot product decoder
-    │
-    ▼
-Explainability
-    ├── GNNExplainer  ──  influential neighbors + graph edges (GCN)
-    └── SHAP          ──  fingerprint bit importance (MLP)
+    ├── MLP Baseline  ──  Concat pair fingerprints → 3-layer MLP
+    ├── GCN           ──  2-layer GCNConv + inner-product decoder
+    └── GAT           ──  2-layer GATConv (4 heads) + inner-product decoder
     │
     ▼
-Streamlit Demo  ──  real-time prediction + explanation for any drug pair
+Dual Explainability
+    ├── GNNExplainer  ──  Topological subgraph & influential drug neighbors (GCN)
+    └── SHAP          ──  Attributed fingerprint sub-structural bits (MLP)
+    │
+    ▼
+Streamlit Web App  ──  Search by drug name + 2D structures + consensus + explorer
 ```
 
 ---
 
-## Dataset
-
-| Source | Description | Size |
-|---|---|---|
-| [BioSNAP-TWOSIDES](https://snap.stanford.edu/biodata/datasets/10017/10017-ChChSe-Decagon.html) | Polypharmacy side effects for drug pairs, filtered to high-confidence interactions | 645 drugs, 63,473 pairs, 1,317 side effects |
-| [PubChem REST API](https://pubchem.ncbi.nlm.nih.gov/docs/pug-rest) | SMILES strings for molecular fingerprint computation | Free, no registration |
-
-**Why BioSNAP over raw TWOSIDES?** Raw TWOSIDES has 4.6M rows with weak signals. BioSNAP is filtered by Stanford researchers to high-confidence interactions, used in most published DDI benchmarks — making results directly comparable to state-of-the-art papers.
-
-**No manual downloads required** — `src/dataset.py` automatically fetches SMILES from PubChem and caches them locally.
-
----
-
-## Project Structure
+##  Project Structure
 
 ```
 drug-interaction-gnn/
 ├── data/
-│   ├── raw/               # BioSNAP-TWOSIDES download
-│   └── processed/         # PyG Data object + SMILES cache (git-ignored)
+│   ├── raw/               # BioSNAP-TWOSIDES dataset (TWOSIDES.csv)
+│   └── processed/         # PyG Data object (ddi_graph.pt) & smiles_cache.csv
 ├── src/
-│   ├── dataset.py         # Graph construction + Morgan fingerprint features
-│   ├── model.py           # MLP baseline, GCN, GAT definitions
-│   ├── train.py           # Training loop + ROC-AUC evaluation
-│   └── explain.py         # GNNExplainer (GCN) + SHAP (MLP)
+│   ├── dataset.py         # Graph construction, PubChem SMILES fetcher, Morgan featurizer
+│   ├── model.py           # MLP Baseline, GCN, and GAT neural network architectures
+│   ├── train.py           # Training pipelines & evaluation loops
+│   └── explain.py         # GNNExplainer & SHAP standalone explainers
+├── app/
+│   ├── streamlit_app.py   # Full interactive Streamlit Web Application
+│   └── drug_names.py      # Drug name resolver & STITCH ID mapping dictionary
 ├── notebooks/
 │   ├── 01_eda.ipynb       # Exploratory data analysis
-│   ├── 02_training.ipynb  # Model training walkthrough
-│   └── 03_explain.ipynb   # Explainability demos
-├── app/
-│   └── streamlit_app.py   # Interactive demo
-├── models/                # Saved checkpoints (git-ignored)
+│   ├── 02_training.ipynb  # Interactive model training walkthrough
+│   └── 03_explain.ipynb   # Visual explainability demonstrations
+├── models/                # Checkpoints (best_mlp.pt, best_gcn.pt, best_gat.pt)
 ├── requirements.txt
 └── README.md
 ```
 
 ---
 
-## Quickstart
+##  Quickstart & Setup
 
+### 1. Environment Setup
 ```bash
-# Clone
+# Clone the repository
 git clone https://github.com/kritanlamichhane/drug-interaction-gnn.git
 cd drug-interaction-gnn
 
-# Create environment
+# Create and activate conda environment
 conda create -n ddi python=3.10 -y
 conda activate ddi
 
-# Install PyTorch (CUDA 12.1)
+# Install PyTorch with CUDA support (e.g., CUDA 12.1)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# Install PyG
-pip install torch-scatter torch-sparse torch-cluster torch-spline-conv \
-  -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
+# Install PyTorch Geometric dependencies
+pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
 pip install torch-geometric
 
-# Install RDKit (must use conda)
+# Install RDKit
 conda install -c conda-forge rdkit -y
 
-# Install remaining dependencies
+# Install remaining Python packages
 pip install -r requirements.txt
+```
 
-# Download BioSNAP-TWOSIDES
-# Place ChChSe-Decagon_polypharmacy.csv in data/raw/TWOSIDES.csv
-
-# Build graph + compute node features (fetches SMILES from PubChem)
+### 2. Prepare Graph & Train Models
+```bash
+# Build PyG graph and fetch/cache SMILES
 python src/dataset.py
 
-# Train all three models
+# Train models
 python -m src.train --model mlp --epochs 50
 python -m src.train --model gcn --epochs 100
 python -m src.train --model gat --epochs 100
 
-# Run explainability
+# Run terminal explainability checks
 python -m src.explain
+```
 
-# Launch Streamlit demo
+### 3. Launch the Streamlit Web App
+```bash
 streamlit run app/streamlit_app.py
 ```
 
 ---
 
-## Explainability
+##  Streamlit App Features
 
-Two complementary approaches are used:
-
-**GNNExplainer (on GCN)** — identifies which neighboring drugs and graph edges are most influential for a specific prediction. Answers: *"which part of the drug network drove this?"*
-
-**SHAP (on MLP)** — identifies which of the 2048 Morgan fingerprint bits most influenced the prediction. Answers: *"which molecular substructures of these two drugs drove this?"*
-
-Together they provide both network-level and molecular-level explanations for every prediction.
-
----
-
-## Installation Notes
-
-Tested on:
-- Python 3.10
-- PyTorch 2.5.1 + CUDA 12.1
-- PyTorch Geometric 2.8.0
-- RDKit (conda-forge)
-- Windows 11, NVIDIA GeForce RTX 3050 6GB Laptop GPU
-
-RDKit **must** be installed via conda, not pip.
+1. **Drug Selection by Generic Name**: Search for compounds like `Ampicillin`, `Fentanyl`, `Lisinopril`, `Aspirin`, `Warfarin`, or search by STITCH ID.
+2. **2D Chemical Structure Visualizer**: Instant local RDKit 2D structure generation with direct link to PubChem compound records.
+3. **Consensus Prediction Card**: Side-by-side risk scorecards for MLP, GCN, and GAT with visual risk meters and clinical recommendations.
+4. **Dual Explainability Suite**:
+   - GNNExplainer: Node importance chart of the most influential surrounding drug nodes.
+   - SHAP: Top positive/negative Morgan fingerprint bits driving the MLP score.
+5. **Knowledge Graph Neighborhood Explorer**: View known interaction partners and mutual shared interactors in the BioSNAP network.
 
 ---
 
-## Limitations
-
-- Negative sampling assumes unobserved pairs are non-interacting — may introduce noise since many pairs are simply unstudied
-- Morgan fingerprints don't capture 3D molecular geometry
-- Model is transductive — retraining required for entirely new drugs not in the graph
-- Binary task only — does not predict which specific side effect will occur
-
----
-
-## Future Work
-
-- Multi-label classification to predict specific side effect types (1,317 classes)
-- Add protein target embeddings as additional node features
-- Heterogeneous graphs with drugs, proteins, and diseases as different node types
-- Inductive setting — generalize to unseen drugs using molecular features alone
-- Fix over-smoothing via residual connections or PairNorm
-
----
-
-
-## License
-
-MIT — free to use for academic and research purposes.
-
----
-
-## Acknowledgements
+##  Acknowledgements & References
 
 - [BioSNAP-TWOSIDES](https://snap.stanford.edu/biodata/datasets/10017/10017-ChChSe-Decagon.html) — Stanford Network Analysis Project
-- [PubChem](https://pubchem.ncbi.nlm.nih.gov/) — National Library of Medicine
-- [PyTorch Geometric](https://pyg.org/) — Fey & Lenssen, 2019
-- Original TWOSIDES — Tatonetti Lab, Columbia University
+- [PubChem REST API](https://pubchem.ncbi.nlm.nih.gov/docs/pug-rest) — National Center for Biotechnology Information (NCBI)
+- [PyTorch Geometric (PyG)](https://pyg.org/) — Fey & Lenssen, 2019
+- [TWOSIDES Database](https://nsides.io/) — Tatonetti Lab, Columbia University
+
+---
+
+##  License
+
+MIT License — Free for academic, scientific, and educational research purposes.
