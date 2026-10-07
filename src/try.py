@@ -1,8 +1,6 @@
 import pandas as pd
-cache = pd.read_csv(
-    "data/processed/smiles_cache.csv",
-    index_col=0
-)
+
+cache = pd.read_csv("data/processed/smiles_cache.csv", index_col=0)
 
 print(cache.head())
 print(cache["smiles"].notna().sum())

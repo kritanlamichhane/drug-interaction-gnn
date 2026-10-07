@@ -4,9 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATConv
 
 
-# =====================================================
 # MLP Baseline
-# =====================================================
 class MLPBaseline(nn.Module):
     def __init__(self, input_dim=2048):
         super().__init__()
@@ -25,10 +23,7 @@ class MLPBaseline(nn.Module):
 
         src, dst = target_edges
 
-        pair_features = torch.cat(
-            [x[src], x[dst]],
-            dim=1
-        )
+        pair_features = torch.cat([x[src], x[dst]], dim=1)
 
         h = F.relu(self.fc1(pair_features))
         h = self.dropout(h)
@@ -43,10 +38,7 @@ class MLPBaseline(nn.Module):
 # GCN Model
 # =====================================================
 class GCNModel(nn.Module):
-    def __init__(self,
-                 input_dim=2048,
-                 hidden_dim=256,
-                 output_dim=64):
+    def __init__(self, input_dim=2048, hidden_dim=256, output_dim=64):
         super().__init__()
 
         self.conv1 = GCNConv(input_dim, hidden_dim)
@@ -76,26 +68,12 @@ class GCNModel(nn.Module):
 # GAT Model
 # =====================================================
 class GATModel(nn.Module):
-    def __init__(self,
-                 input_dim=2048,
-                 hidden_dim=256,
-                 output_dim=64,
-                 heads=4):
+    def __init__(self, input_dim=2048, hidden_dim=256, output_dim=64, heads=4):
         super().__init__()
 
-        self.conv1 = GATConv(
-            input_dim,
-            hidden_dim,
-            heads=heads,
-            dropout=0.3
-        )
+        self.conv1 = GATConv(input_dim, hidden_dim, heads=heads, dropout=0.3)
 
-        self.conv2 = GATConv(
-            hidden_dim * heads,
-            output_dim,
-            heads=1,
-            dropout=0.3
-        )
+        self.conv2 = GATConv(hidden_dim * heads, output_dim, heads=1, dropout=0.3)
 
         self.dropout = nn.Dropout(0.3)
 
