@@ -272,9 +272,19 @@ def load_everything():
         gat.load_state_dict(torch.load('models/best_gat.pt', map_location=device, weights_only=False))
         gat.eval()
 
-    # Load drug vocabulary
-    pairs = load_twosides('data/raw/TWOSIDES.csv')
-    drug2idx = build_drug_vocab(pairs)
+    # Load drug vocabulary (with fallback for lightweight cloud deployment)
+    if os.path.exists('data/raw/TWOSIDES.csv'):
+        pairs = load_twosides('data/raw/TWOSIDES.csv')
+        drug2idx = build_drug_vocab(pairs)
+    elif os.path.exists('data/processed/smiles_cache.csv'):
+        cache_df = pd.read_csv('data/processed/smiles_cache.csv', index_col=0)
+        drugs = list(cache_df.index)
+        drug2idx = {drug: idx for idx, drug in enumerate(drugs)}
+    else:
+        from app.drug_names import DRUG_NAMES
+        drugs = list(DRUG_NAMES.keys())
+        drug2idx = {drug: idx for idx, drug in enumerate(drugs)}
+
     idx2drug = {v: k for k, v in drug2idx.items()}
 
     # Load SMILES cache if available
@@ -285,6 +295,7 @@ def load_everything():
             smiles_map = cache_df['smiles'].dropna().to_dict()
         except Exception:
             pass
+
 
     return mlp, gcn, gat, x, edge_index, drug2idx, idx2drug, smiles_map, device
 
